@@ -8,6 +8,7 @@ import bcrypt from "bcrypt";
 dotenv.config();
 
 const app = express();
+// Ensure the fallback matches your Docker EXPOSE and App Runner settings
 const PORT = process.env.PORT || 3000;
 
 // Database Connection
@@ -30,12 +31,22 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// Critical: Verify SMTP connection on startup to avoid silent crashes
+transporter.verify((error, success) => {
+  if (error) {
+    console.warn("SMTP Transporter warning:", error.message);
+  } else {
+    console.log("Server is ready to send emails");
+  }
+});
+
 app.use(cors());
 app.use(express.json());
 
-// Health Check Route (Required for AWS App Runner to stay 'Healthy')
+// --- AWS App Runner Health Check ---
+// Without this, App Runner will fail the deployment even if the server is running
 app.get("/", (req, res) => {
-  res.status(200).send("Nexus Meet Server is running");
+  res.status(200).send("Nexus Meet Server Health Check: OK");
 });
 
 const otpStore = new Map<string, { otp: string; expires: number }>();
@@ -62,7 +73,7 @@ app.post("/api/auth/send-otp", async (req, res) => {
   }
 });
 
-// 2. Signup / Set Password (Using transaction for multi-table insert)
+// 2. Signup / Set Password
 app.post("/api/auth/signup", async (req, res) => {
   const { email, password, otp, provider = 'email' } = req.body;
   
@@ -138,6 +149,11 @@ app.post("/api/auth/sync", async (req, res) => {
     console.error("Sync Error:", err);
     res.status(500).json({ error: "Sync failed" });
   }
+});
+
+// Global Error Handlers to prevent Exit Code 1 crashes
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
 });
 
 app.listen(PORT, "0.0.0.0", () => {

@@ -8,16 +8,18 @@ import bcrypt from "bcrypt";
 dotenv.config();
 
 const app = express();
-// Ensure the fallback matches your Docker EXPOSE and App Runner settings
+// Port 3000 is used to match your current App Runner and Docker configuration
 const PORT = process.env.PORT || 3000;
 
-// Database Connection
+// Database Connection for Supabase
+// Use the Connection String details from your Supabase Project Settings -> Database
 const pool = new Pool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
+  host: process.env.DB_HOST || 'db.eslozrabziwinovsoaen.supabase.co',
+  user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
+  database: process.env.DB_NAME || 'postgres',
   port: parseInt(process.env.DB_PORT || "5432"),
+  // Supabase requires SSL for external connections
   ssl: { rejectUnauthorized: false }
 });
 
@@ -31,22 +33,13 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Critical: Verify SMTP connection on startup to avoid silent crashes
-transporter.verify((error, success) => {
-  if (error) {
-    console.warn("SMTP Transporter warning:", error.message);
-  } else {
-    console.log("Server is ready to send emails");
-  }
-});
-
 app.use(cors());
 app.use(express.json());
 
 // --- AWS App Runner Health Check ---
-// Without this, App Runner will fail the deployment even if the server is running
+// Essential to prevent "Health check failed" errors in App Runner
 app.get("/", (req, res) => {
-  res.status(200).send("Nexus Meet Server Health Check: OK");
+  res.status(200).send("Nexus Meet Server (Supabase) is Healthy");
 });
 
 const otpStore = new Map<string, { otp: string; expires: number }>();
@@ -151,7 +144,7 @@ app.post("/api/auth/sync", async (req, res) => {
   }
 });
 
-// Global Error Handlers to prevent Exit Code 1 crashes
+// Prevent server crash on unhandled promise rejections
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Rejection:', reason);
 });

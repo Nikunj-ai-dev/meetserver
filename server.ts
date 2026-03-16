@@ -1,6 +1,8 @@
 import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
 import cors from "cors";
-import { Pool } from "pg";
+import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
 import bcrypt from "bcrypt";
@@ -8,24 +10,26 @@ import bcrypt from "bcrypt";
 dotenv.config();
 
 const app = express();
-// Port 3000 is used to match your current App Runner and Docker configuration
 const PORT = process.env.PORT || 3000;
 
-// Database Connection for Supabase
-// Use the Connection String details from your Supabase Project Settings -> Database
-const pool = new Pool({
-  host: process.env.DB_HOST || 'db.eslozrabziwinovsoaen.supabase.co',
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'postgres',
-  port: parseInt(process.env.DB_PORT || "5432"),
-  // Supabase requires SSL for external connections
-  ssl: { rejectUnauthorized: false }
-});
+/**
+ * SUPABASE CONFIGURATION
+ * Accessed via Supabase URL (derived from ID) and Anon Key
+ */
+const SUPABASE_URL = process.env.SUPABASE_URL || `https://${process.env.SUPABASE_ID}.supabase.co`;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// SMTP Transporter for OTP
+// Initialize Supabase client
+// Note: On the backend, if you have RLS enabled, you might need the SERVICE_ROLE_KEY 
+// instead of the ANON_KEY to perform admin actions like querying all users.
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY!);
+
+/**
+ * SMTP CONFIGURATION (Brevo)
+ * All values moved to ENV variables as requested
+ */
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_SERVER,
+  host: process.env.SMTP_SERVER || "smtp-relay.brevo.com",
   port: parseInt(process.env.SMTP_PORT || "587"),
   auth: {
     user: process.env.SMTP_LOGIN,
@@ -33,122 +37,196 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-app.use(cors());
-app.use(express.json());
-
-// --- AWS App Runner Health Check ---
-// Essential to prevent "Health check failed" errors in App Runner
-app.get("/", (req, res) => {
-  res.status(200).send("Nexus Meet Server (Supabase) is Healthy");
-});
-
+// In-memory OTP store
 const otpStore = new Map<string, { otp: string; expires: number }>();
 
-// 1. Send OTP
-app.post("/api/auth/send-otp", async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: "Email is required" });
+async function startServer() {
+  app.use(cors());
+  app.use(express.json());
 
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  otpStore.set(email, { otp, expires: Date.now() + 600000 });
+  // AWS Health Check
+  app.get("/health", (req, res) => res.status(200).send("OK"));
 
-  try {
-    await transporter.sendMail({
-      from: `"Nexus Meet" <${process.env.SENDER_EMAIL}>`,
-      to: email,
-      subject: "Your Verification Code",
-      html: `<b>Your OTP is ${otp}</b><p>It expires in 10 minutes.</p>`,
-    });
-    res.json({ success: true, message: "OTP sent" });
-  } catch (err) {
-    console.error("Mail Error:", err);
-    res.status(500).json({ error: "Failed to send email" });
-  }
-});
+  /**
+   * 1. SEND OTP
+   */
+  app.post("/api/auth/send-otp", async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Email is required" });
 
-// 2. Signup / Set Password
-app.post("/api/auth/signup", async (req, res) => {
-  const { email, password, otp, provider = 'email' } = req.body;
-  
-  if (provider === 'email') {
-    const stored = otpStore.get(email);
-    if (!stored || stored.otp !== otp || stored.expires < Date.now()) {
-      return res.status(400).json({ error: "Invalid or expired OTP" });
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    otpStore.set(email, { otp, expires: Date.now() + 600000 });
+
+    try {
+      await transporter.sendMail({
+        from: `"Nexus Meet" <${process.env.SENDER_EMAIL}>`,
+        to: email,
+        subject: "Your Verification Code - Nexus Meet",
+        html: `<div style="font-family: sans-serif; padding: 20px; text-align: center;">
+                <h2 style="color: #4f46e5;">Nexus Meet</h2>
+                <p>Your verification code is:</p>
+                <div style="font-size: 32px; font-weight: bold; margin: 20px 0;">${otp}</div>
+                <p>Expires in 10 minutes.</p>
+              </div>`,
+      });
+      res.json({ success: true, message: "OTP sent" });
+    } catch (err) {
+      console.error("Email error:", err);
+      res.status(500).json({ error: "Failed to send email" });
     }
-    otpStore.delete(email);
-  }
+  });
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const passwordHash = await bcrypt.hash(password, 10);
+  /**
+   * 2. SIGNUP / COMPLETE SOCIAL SIGNUP
+   */
+  app.post("/api/auth/signup", async (req, res) => {
+    const { email, password, otp, provider = 'email' } = req.body;
     
-    let userRes = await client.query("SELECT id FROM users WHERE email = $1", [email]);
-    let userId;
-
-    if (userRes.rows.length === 0) {
-      const newUser = await client.query(
-        "INSERT INTO users (email, password_hash, auth_provider, is_verified) VALUES ($1, $2, $3, $4) RETURNING id",
-        [email, passwordHash, provider, true]
-      );
-      userId = newUser.rows[0].id;
-      await client.query("INSERT INTO user_profiles (user_id, display_name) VALUES ($1, $2)", [userId, email.split("@")[0]]);
-    } else {
-      userId = userRes.rows[0].id;
-      await client.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, userId]);
+    if (provider === 'email' && otp) {
+      const stored = otpStore.get(email);
+      if (!stored || stored.otp !== otp || stored.expires < Date.now()) {
+        return res.status(400).json({ error: "Invalid or expired OTP" });
+      }
+      otpStore.delete(email);
     }
 
-    await client.query("COMMIT");
-    res.json({ success: true, userId });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("Signup Error:", err);
-    res.status(500).json({ error: "Signup failed" });
-  } finally {
-    client.release();
+    try {
+      const passwordHash = await bcrypt.hash(password, 10);
+      const dbProvider = provider === 'google.com' ? 'google' : 'email';
+
+      // Check if user exists
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email)
+        .single();
+
+      let userId;
+
+      if (!existingUser) {
+        // Create Org if none exists
+        let { data: orgs } = await supabase.from('organizations').select('id').limit(1);
+        let orgId = orgs?.[0]?.id;
+
+        if (!orgId) {
+          const { data: newOrg } = await supabase
+            .from('organizations')
+            .insert({ name: "My Workspace", billing_tier: "free" })
+            .select()
+            .single();
+          orgId = newOrg?.id;
+        }
+
+        // Create User
+        const { data: newUser, error: userErr } = await supabase
+          .from('users')
+          .insert({
+            org_id: orgId,
+            email,
+            password_hash: passwordHash,
+            auth_provider: dbProvider,
+            is_verified: true,
+            role: 'member'
+          })
+          .select()
+          .single();
+        
+        if (userErr) throw userErr;
+        userId = newUser.id;
+
+        // Create Profile
+        await supabase.from('user_profiles').insert({
+          user_id: userId,
+          display_name: email.split("@")[0]
+        });
+      } else {
+        // Update existing user
+        userId = existingUser.id;
+        await supabase
+          .from('users')
+          .update({ password_hash: passwordHash, is_verified: true, auth_provider: dbProvider })
+          .eq('id', userId);
+      }
+
+      res.json({ success: true, userId });
+    } catch (err) {
+      console.error("Signup error:", err);
+      res.status(500).json({ error: "Signup failed" });
+    }
+  });
+
+  /**
+   * 3. LOGIN
+   */
+  app.post("/api/auth/login", async (req, res) => {
+    const { email, password } = req.body;
+    try {
+      const { data: user, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email)
+        .single();
+
+      if (error || !user) return res.status(401).json({ error: "Account not found" });
+
+      const valid = await bcrypt.compare(password, user.password_hash);
+      if (!valid) return res.status(401).json({ error: "Invalid password" });
+
+      const { data: profile } = await supabase
+        .from('user_profiles')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+      
+      res.json({ 
+        success: true, 
+        user: { id: user.id, email: user.email, displayName: profile?.display_name, orgId: user.org_id } 
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Login failed" });
+    }
+  });
+
+  /**
+   * 4. SOCIAL SYNC
+   */
+  app.post("/api/auth/sync", async (req, res) => {
+    const { email, displayName, photoURL } = req.body;
+    try {
+      const { data: user } = await supabase.from('users').select('id').eq('email', email).single();
+      
+      if (!user) return res.json({ success: true, needsPassword: true });
+
+      await supabase
+        .from('user_profiles')
+        .upsert({
+          user_id: user.id,
+          display_name: displayName,
+          avatar_url: photoURL,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id' });
+
+      res.json({ success: true, userId: user.id });
+    } catch (err) {
+      res.status(500).json({ error: "Sync failed" });
+    }
+  });
+
+  /**
+   * VITE & STATIC SERVING
+   */
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
-});
 
-// 3. Login
-app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
-  try {
-    const userRes = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-    if (userRes.rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
-    const user = userRes.rows[0];
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: "Invalid credentials" });
-
-    const profileRes = await pool.query("SELECT * FROM user_profiles WHERE user_id = $1", [user.id]);
-    res.json({ success: true, user: { ...user, profile: profileRes.rows[0] } });
-  } catch (err) {
-    console.error("Login Error:", err);
-    res.status(500).json({ error: "Login failed" });
-  }
-});
-
-// 4. Social Sync
-app.post("/api/auth/sync", async (req, res) => {
-  const { email, displayName, photoURL } = req.body;
-  try {
-    let userRes = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-    if (userRes.rows.length === 0) return res.json({ success: true, needsPassword: true });
-
-    const userId = userRes.rows[0].id;
-    await pool.query("UPDATE user_profiles SET display_name = $1, avatar_url = $2 WHERE user_id = $3", [displayName, photoURL, userId]);
-    res.json({ success: true, userId });
-  } catch (err) {
-    console.error("Sync Error:", err);
-    res.status(500).json({ error: "Sync failed" });
-  }
-});
-
-// Prevent server crash on unhandled promise rejections
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});
+startServer();

@@ -33,6 +33,11 @@ const transporter = nodemailer.createTransport({
 app.use(cors());
 app.use(express.json());
 
+// Health Check Route (Required for AWS App Runner to stay 'Healthy')
+app.get("/", (req, res) => {
+  res.status(200).send("Nexus Meet Server is running");
+});
+
 const otpStore = new Map<string, { otp: string; expires: number }>();
 
 // 1. Send OTP
@@ -52,11 +57,12 @@ app.post("/api/auth/send-otp", async (req, res) => {
     });
     res.json({ success: true, message: "OTP sent" });
   } catch (err) {
+    console.error("Mail Error:", err);
     res.status(500).json({ error: "Failed to send email" });
   }
 });
 
-// 2. Signup / Set Password
+// 2. Signup / Set Password (Using transaction for multi-table insert)
 app.post("/api/auth/signup", async (req, res) => {
   const { email, password, otp, provider = 'email' } = req.body;
   
@@ -92,6 +98,7 @@ app.post("/api/auth/signup", async (req, res) => {
     res.json({ success: true, userId });
   } catch (err) {
     await client.query("ROLLBACK");
+    console.error("Signup Error:", err);
     res.status(500).json({ error: "Signup failed" });
   } finally {
     client.release();
@@ -102,31 +109,33 @@ app.post("/api/auth/signup", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   try {
-    const userRes = await client.query("SELECT * FROM users WHERE email = $1", [email]);
+    const userRes = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
     if (userRes.rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
 
     const user = userRes.rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: "Invalid credentials" });
 
-    const profileRes = await client.query("SELECT * FROM user_profiles WHERE user_id = $1", [user.id]);
+    const profileRes = await pool.query("SELECT * FROM user_profiles WHERE user_id = $1", [user.id]);
     res.json({ success: true, user: { ...user, profile: profileRes.rows[0] } });
   } catch (err) {
+    console.error("Login Error:", err);
     res.status(500).json({ error: "Login failed" });
   }
 });
 
 // 4. Social Sync
 app.post("/api/auth/sync", async (req, res) => {
-  const { email, displayName, photoURL, providerId } = req.body;
+  const { email, displayName, photoURL } = req.body;
   try {
-    let userRes = await client.query("SELECT * FROM users WHERE email = $1", [email]);
+    let userRes = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
     if (userRes.rows.length === 0) return res.json({ success: true, needsPassword: true });
 
     const userId = userRes.rows[0].id;
-    await client.query("UPDATE user_profiles SET display_name = $1, avatar_url = $2 WHERE user_id = $3", [displayName, photoURL, userId]);
+    await pool.query("UPDATE user_profiles SET display_name = $1, avatar_url = $2 WHERE user_id = $3", [displayName, photoURL, userId]);
     res.json({ success: true, userId });
   } catch (err) {
+    console.error("Sync Error:", err);
     res.status(500).json({ error: "Sync failed" });
   }
 });
